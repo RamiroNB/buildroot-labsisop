@@ -13,61 +13,80 @@
 
 /* SSTF data structure. */
 struct sstf_data {
-	struct list_head queue;
+	struct list_head queue;  // List of requests
+	sector_t head_pos;       // Current head position
 };
 
+/* Merging requests: remove the next request from the list. */
 static void sstf_merged_requests(struct request_queue *q, struct request *rq,
 				 struct request *next)
 {
 	list_del_init(&next->queuelist);
 }
 
-/* Esta função despacha o próximo bloco a ser lido. */
-static int sstf_dispatch(struct request_queue *q, int force){
+/* Dispatch the request with the shortest seek time (closest to head position). */
+static int sstf_dispatch(struct request_queue *q, int force)
+{
 	struct sstf_data *nd = q->elevator->elevator_data;
-	char direction = 'R';
-	struct request *rq;
+	struct request *rq, *closest_rq = NULL;
+	struct list_head *pos;
+	sector_t closest_distance = ~((sector_t)0); // Maximum possible distance
 
-	/* Aqui deve-se retirar uma requisição da fila e enviá-la para processamento.
-	 * Use como exemplo o driver noop-iosched.c. Veja como a requisição é tratada.
-	 *
-	 * Antes de retornar da função, imprima o sector que foi atendido.
-	 */
+	if (list_empty(&nd->queue))  // Check if queue is empty
+		return 0;
 
-	rq = list_first_entry_or_null(&nd->queue, struct request, queuelist);
-	if (rq) {
-		list_del_init(&rq->queuelist);
-		elv_dispatch_sort(q, rq);
-		printk(KERN_EMERG "[SSTF] dsp %c %llu\n", direction, blk_rq_pos(rq));
+	// Traverse the queue to find the request closest to the current head position
+	list_for_each(pos, &nd->queue) {
+		rq = list_entry(pos, struct request, queuelist);
+		sector_t distance = abs(blk_rq_pos(rq) - nd->head_pos);
 
+		if (distance < closest_distance) {
+			closest_distance = distance;
+			closest_rq = rq;
+		}
+	}
+
+	if (closest_rq) {
+		list_del_init(&closest_rq->queuelist);
+		elv_dispatch_sort(q, closest_rq);
+		nd->head_pos = blk_rq_pos(closest_rq);  // Update head position
+		printk(KERN_INFO "[SSTF] Dispatching sector %llu (new head pos: %llu)\n",
+		       blk_rq_pos(closest_rq), nd->head_pos);
 		return 1;
 	}
+
 	return 0;
 }
 
-static void sstf_add_request(struct request_queue *q, struct request *rq){
+/* Add a request to the queue, maintaining SSTF order (shortest seek time first). */
+static void sstf_add_request(struct request_queue *q, struct request *rq)
+{
 	struct sstf_data *nd = q->elevator->elevator_data;
-	char direction = 'R';
+	struct list_head *pos;
+	struct request *iter_rq;
 
-	/* Aqui deve-se adicionar uma requisição na fila do driver.
-	 * Use como exemplo o driver noop-iosched.c
-	 *
-	 * Antes de retornar da função, imprima o sector que foi adicionado na lista.
-	 */
+	// Insert the new request in the queue, sorted by proximity to the head position
+	list_for_each(pos, &nd->queue) {
+		iter_rq = list_entry(pos, struct request, queuelist);
+		if (abs(blk_rq_pos(iter_rq) - nd->head_pos) > abs(blk_rq_pos(rq) - nd->head_pos)) {
+			list_add_tail(&rq->queuelist, pos);  // Insert the new request before iter_rq
+			printk(KERN_INFO "[SSTF] Added sector %llu (current head pos: %llu)\n",
+			       blk_rq_pos(rq), nd->head_pos);
+			return;
+		}
+	}
 
+	// If no suitable position found, add it to the end of the queue
 	list_add_tail(&rq->queuelist, &nd->queue);
-	printk(KERN_EMERG "[SSTF] add %c %llu\n", direction, blk_rq_pos(rq));
+	printk(KERN_INFO "[SSTF] Added sector %llu to the end (current head pos: %llu)\n",
+	       blk_rq_pos(rq), nd->head_pos);
 }
 
-static int sstf_init_queue(struct request_queue *q, struct elevator_type *e){
+/* Initialize the SSTF queue. */
+static int sstf_init_queue(struct request_queue *q, struct elevator_type *e)
+{
 	struct sstf_data *nd;
 	struct elevator_queue *eq;
-
-	/* Implementação da inicialização da fila (queue).
-	 *
-	 * Use como exemplo a inicialização da fila no driver noop-iosched.c
-	 *
-	 */
 
 	eq = elevator_alloc(q, e);
 	if (!eq)
@@ -78,9 +97,10 @@ static int sstf_init_queue(struct request_queue *q, struct elevator_type *e){
 		kobject_put(&eq->kobj);
 		return -ENOMEM;
 	}
-	eq->elevator_data = nd;
 
 	INIT_LIST_HEAD(&nd->queue);
+	nd->head_pos = 0;  // Start head position at 0 (or wherever the disk head starts)
+	eq->elevator_data = nd;
 
 	spin_lock_irq(q->queue_lock);
 	q->elevator = eq;
@@ -89,20 +109,16 @@ static int sstf_init_queue(struct request_queue *q, struct elevator_type *e){
 	return 0;
 }
 
+/* Cleanup the SSTF queue. */
 static void sstf_exit_queue(struct elevator_queue *e)
 {
 	struct sstf_data *nd = e->elevator_data;
 
-	/* Implementação da finalização da fila (queue).
-	 *
-	 * Use como exemplo o driver noop-iosched.c
-	 *
-	 */
 	BUG_ON(!list_empty(&nd->queue));
 	kfree(nd);
 }
 
-/* Infrastrutura dos drivers de IO Scheduling. */
+/* SSTF elevator type definition. */
 static struct elevator_type elevator_sstf = {
 	.ops.sq = {
 		.elevator_merge_req_fn		= sstf_merged_requests,
@@ -115,13 +131,13 @@ static struct elevator_type elevator_sstf = {
 	.elevator_owner = THIS_MODULE,
 };
 
-/* Inicialização do driver. */
+/* Initialize the SSTF module. */
 static int __init sstf_init(void)
 {
 	return elv_register(&elevator_sstf);
 }
 
-/* Finalização do driver. */
+/* Exit the SSTF module. */
 static void __exit sstf_exit(void)
 {
 	elv_unregister(&elevator_sstf);
